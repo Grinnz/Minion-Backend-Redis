@@ -45,6 +45,7 @@
             "Minion" : "8.0",
             "Mojo::Redis2" : "0.28",
             "Mojolicious" : "7.0",
+            "Sort::Versions" : "0",
             "Sys::Hostname" : "0",
             "Time::HiRes" : "0",
             "perl" : "5.010001"

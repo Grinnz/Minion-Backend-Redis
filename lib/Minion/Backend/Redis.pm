@@ -8,6 +8,7 @@ use Mojo::IOLoop;
 use Mojo::JSON qw(from_json to_json);
 use Mojo::Redis2;
 use Mojo::Util 'encode';
+use Sort::Versions 'versioncmp';
 use Sys::Hostname 'hostname';
 use Time::HiRes 'time';
 
@@ -15,7 +16,15 @@ our $VERSION = '0.001';
 
 has 'redis';
 
-sub new { return shift->SUPER::new(redis => Mojo::Redis2->new(url => shift)) }
+sub new {
+  my $self = shift->SUPER::new(redis => Mojo::Redis2->new(url => shift));
+
+  my $redis_version = $self->redis->backend->info('server')->{redis_version};
+  croak 'Redis Server 2.8.0 or later is required'
+    if versioncmp($redis_version, '2.8.0') == -1;
+
+  return $self;
+}
 
 sub broadcast {
   my ($self, $command, $args, $ids) = (shift, shift, shift || [], shift || []);
@@ -551,6 +560,8 @@ Minion::Backend::Redis - Redis backend for Minion job queue
 =head1 DESCRIPTION
 
 L<Minion::Backend::Redis> is a backend for L<Minion> based on L<Mojo::Redis2>.
+Note that L<Redis Server|https://redis.io/download> version C<2.8.0> or newer
+is required to use this backend.
 
 =head1 ATTRIBUTES
 

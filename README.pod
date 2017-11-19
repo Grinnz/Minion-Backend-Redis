@@ -22,6 +22,8 @@ Minion::Backend::Redis - Redis backend for Minion job queue
 =head1 DESCRIPTION
 
 L<Minion::Backend::Redis> is a backend for L<Minion> based on L<Mojo::Redis2>.
+Note that L<Redis Server|https://redis.io/download> version C<2.8.0> or newer
+is required to use this backend.
 
 =head1 ATTRIBUTES
 

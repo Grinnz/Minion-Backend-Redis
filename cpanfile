@@ -5,6 +5,7 @@ requires 'List::Util' => '1.33';
 requires 'Minion' => '8.0';
 requires 'Mojolicious' => '7.0';
 requires 'Mojo::Redis2' => '0.28';
+requires 'Sort::Versions';
 requires 'Sys::Hostname';
 requires 'Time::HiRes';
 test_requires 'Test::More' => '0.88';
