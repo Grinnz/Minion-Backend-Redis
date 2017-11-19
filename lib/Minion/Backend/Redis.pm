@@ -92,6 +92,7 @@ sub enqueue {
 
   $tx->hmset("minion.job.$id.notes", %notes) if %notes;
   $tx->sadd("minion.job.$id.parents", @$parents) if @$parents;
+  $tx->sadd("minion.job.$_.children", $id) for @$parents;
 
   $tx->sadd("minion.job_queue.$queue", $id);
   $tx->sadd('minion.job_state.inactive', $id);
@@ -136,13 +137,7 @@ sub list_jobs {
   foreach my $id (@job_ids) {
     my %job_info = @{$self->redis->hgetall("minion.job.$id")};
 
-    my $job_scan = $self->redis->sscan('minion.jobs', 0);
-    my %children;
-    foreach my $job_id (@{$job_scan->all}) {
-      next if $job_id == $id;
-      $children{$job_id} = 1
-        if $self->redis->sismember("minion.job.$job_id.parents", $id);
-    }
+    my $children = $self->redis->smembers("minion.job.$id.children");
 
     my %notes = @{$self->redis->hgetall("minion.job.$id.notes")};
     $_ = from_json($_) for values %notes;
@@ -151,7 +146,7 @@ sub list_jobs {
       id       => $job_info{id},
       args     => from_json($job_info{args} // 'null'),
       attempts => $job_info{attempts},
-      children => [keys %children],
+      children => $children,
       created  => $job_info{created},
       delayed  => $job_info{delayed},
       finished => $job_info{finished},
@@ -292,31 +287,27 @@ sub repair {
 
   # Jobs with missing worker (can be retried)
   my $active_scan = $redis->sscan('minion.job_state.active', 0);
-  my %fail;
   foreach my $id (@{$active_scan->all}) {
-    my ($retries, $worker) = @{$redis->hmget("minion.job.$id", qw(retries worker))};
-    $fail{$id} = $retries unless defined $worker
-      and $redis->sismember('minion.workers', $worker);
+    my ($retries, $state, $worker) =
+      @{$redis->hmget("minion.job.$id", qw(retries state worker))};
+    next unless defined $state and $state eq 'active';
+    next if defined $worker and $redis->sismember('minion.workers', $worker);
+    $self->fail_job($id, $retries, 'Worker went away');
   }
-  $self->fail_job($_, $fail{$_}, 'Worker went away') for keys %fail;
 
   # Old jobs with no unresolved dependencies
   my $finished_scan = $redis->sscan('minion.job_state.finished', 0);
-  my %old;
-  foreach my $id (@{$finished_scan->all}) {
-    my $finished = $redis->hget("minion.job.$id", 'finished');
-    next unless defined $finished and $finished <= time - $minion->remove_after;
-    my $unfinished = $redis->sdiff('minion.jobs', 'minion.job_state.finished');
-    $old{$id} = 1 if none { $redis->sismember("minion.job.$_.parents", $id) } @$unfinished;
-  }
-  
-  foreach my $id (keys %old) {
-    my $tx = $redis->multi;
-    $tx->watch("minion.job.$id");
-    my ($queue, $state, $task, $worker) =
-      @{$redis->hmget("minion.job.$id", qw(queue state task worker))};
-    _delete_job($tx, $id, $queue, $state, $task, $worker);
-    $tx->exec;
+  while (my $ids = $finished_scan->next) {
+    foreach my $id (@$ids) {
+      my $tx = $redis->multi;
+      $tx->watch("minion.job.$id", "minion.job.$id.children");
+      my ($finished, $queue, $state, $task, $worker) =
+        @{$redis->hmget("minion.job.$id", qw(finished queue state task worker))};
+      next unless defined $finished && $finished <= time - $minion->remove_after;
+      next if @{$redis->sdiff("minion.job.$id.children", 'minion.job_state.finished')};
+      _delete_job($tx, $id, $queue, $state, $task, $worker);
+      $tx->exec;
+    }
   }
 }
 
@@ -385,13 +376,11 @@ sub stats {
       or $self->redis->scard("minion.job.$id.parents");
   }
   $stats{delayed_jobs} = keys %delayed_jobs;
-  my $worker_scan = $self->redis->sscan('minion.workers', 0);
-  my %active_workers;
-  foreach my $id (@{$worker_scan->all}) {
-    $active_workers{$id} = 1
+  $stats{active_workers} = 0;
+  foreach my $id (@{$self->redis->smembers('minion.workers')}) {
+    $stats{active_workers}++
       if @{$self->redis->sinter('minion.job_state.active', "minion.worker.$id.jobs")};
   }
-  $stats{active_workers} = keys %active_workers;
   $stats{enqueued_jobs} = $self->redis->get('minion.last_job_id') // 0;
   $stats{inactive_workers} = $self->redis->scard('minion.workers') - $stats{active_workers};
   
@@ -418,7 +407,8 @@ sub unregister_worker {
 
 sub _delete_job {
   my ($redis, $id, $queue, $state, $task, $worker) = @_;
-  $redis->del("minion.job.$id", "minion.job.$id.notes", "minion.job.$id.parents");
+  $redis->del("minion.job.$id", "minion.job.$id.notes",
+    "minion.job.$id.parents", "minion.job.$id.children");
   $redis->srem("minion.job_queue.$queue", $id);
   $redis->srem("minion.job_state.$state", $id);
   $redis->srem("minion.job_task.$task", $id);
@@ -429,7 +419,8 @@ sub _delete_job {
 
 sub _delete_worker {
   my ($redis, $id) = @_;
-  $redis->del("minion.worker.$id", "minion.worker.$id.inbox", "minion.worker.$id.jobs");
+  $redis->del("minion.worker.$id", "minion.worker.$id.inbox",
+    "minion.worker.$id.jobs");
   $redis->srem('minion.workers', $id);
   $redis->zrem('minion.worker_notified', $id);
 }
