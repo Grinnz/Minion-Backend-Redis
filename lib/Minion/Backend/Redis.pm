@@ -381,13 +381,7 @@ sub stats {
   $stats{active_jobs} = $self->redis->scard('minion.job_state.active');
   $stats{failed_jobs} = $self->redis->scard('minion.job_state.failed');
   $stats{finished_jobs} = $self->redis->scard('minion.job_state.finished');
-  my $inactive_scan = $self->redis->sscan('minion.job_state.inactive', 0);
-  my $now = time;
-  my %delayed_jobs;
-  foreach my $id (@{$inactive_scan->all}) {
-    $delayed_jobs{$id} = 1 if $self->redis->hget("minion.job.$id", 'delayed') > $now;
-  }
-  $stats{delayed_jobs} = keys %delayed_jobs;
+  $stats{delayed_jobs} = $self->redis->zcount('minion.inactive_job_delayed', time, '+inf');
   $stats{active_workers} = 0;
   foreach my $id (@{$self->redis->smembers('minion.workers')}) {
     $stats{active_workers}++
