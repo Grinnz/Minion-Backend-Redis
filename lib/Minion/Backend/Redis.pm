@@ -73,17 +73,20 @@ sub enqueue {
   $_ = to_json($_) for values %notes;
   my $parents = $options->{parents} || [];
   my $queue = $options->{queue} // 'default';
+  my $attempts = $options->{attempts} // 1;
+  my $priority = $options->{priority} // 0;
   my $now = time;
+  my $delayed = $now + ($options->{delay} // 0);
 
   my $tx = $self->redis->multi;
   $tx->hmset("minion.job.$id",
     id       => $id,
     args     => to_json($args),
-    attempts => $options->{attempts} // 1,
+    attempts => $attempts,
     created  => $now,
-    delayed  => $now + ($options->{delay} // 0),
+    delayed  => $delayed,
     parents  => to_json($parents),
-    priority => $options->{priority} // 0,
+    priority => $priority,
     queue    => $queue,
     retries  => 0,
     state    => 'inactive',
@@ -100,10 +103,14 @@ sub enqueue {
   $tx->sadd("minion.job_task.$task", $id);
   $tx->sadd('minion.jobs', $id);
 
+  my $alphaid = sprintf '%012d', $id;
+  $tx->zadd("minion.inactive_job_queue.$queue", (0-$priority) => $alphaid);
+  $tx->zadd("minion.inactive_job_task.$task", 0 => $alphaid);
+  $tx->zadd('minion.inactive_job_delayed', $delayed => $id);
+
   $tx->exec;
 
-  $self->_ready_job($id);
-  $self->_notify_job if !defined $options->{delay} or $options->{delay} <= 0;
+  $self->_notify_job if $delayed <= $now;
 
   return $id;
 }
@@ -325,25 +332,27 @@ sub retry_job {
   my $now = time;
   my %set;
   $set{attempts} = $options->{attempts} if defined $options->{attempts};
-  $set{delayed} = $now + ($options->{delay} // 0);
+  $set{delayed} = my $delayed = $now + ($options->{delay} // 0);
   $set{priority} = $options->{priority} if defined $options->{priority};
   $set{retried} = $now;
 
   my $tx = $self->redis->multi;
   $tx->watch("minion.job.$id");
 
-  my ($curr_queue, $curr_retries, $curr_state) =
-    @{$self->redis->hmget("minion.job.$id", qw(queue retries state))};
+  my ($curr_queue, $curr_priority, $curr_retries, $curr_state, $task) =
+    @{$self->redis->hmget("minion.job.$id",
+    qw(queue priority retries state task))};
   return !!0 unless defined $curr_retries and $curr_retries == $retries;
 
   $tx->hmset("minion.job.$id", %set);
   $tx->hincrby("minion.job.$id", retries => 1);
 
+  my $alphaid = sprintf '%012d', $id;
   if (defined $options->{queue}) {
     $tx->hset("minion.job.$id", queue => $options->{queue});
     $tx->srem("minion.job_queue.$curr_queue", $id);
     $tx->sadd("minion.job_queue.$options->{queue}", $id);
-    $tx->zrem("minion.ready_job_queue.$curr_queue", sprintf('%012d', $id));
+    $tx->zrem("minion.inactive_job_queue.$curr_queue", $alphaid);
   }
 
   $tx->hset("minion.job.$id", state => 'inactive');
@@ -351,10 +360,15 @@ sub retry_job {
   $tx->sadd('minion.job_state.inactive', $id);
   $tx->sadd('minion.job_state.inactive,active,failed', $id);
 
+  my $priority = $options->{priority} // $curr_priority;
+  my $queue = $options->{queue} // $curr_queue;
+  $tx->zadd("minion.inactive_job_queue.$queue", (0-$priority) => $alphaid);
+  $tx->zadd("minion.inactive_job_task.$task", 0 => $alphaid);
+  $tx->zadd('minion.inactive_job_delayed', $delayed => $id);
+
   $tx->exec;
 
-  $self->_ready_job($id);
-  $self->_notify_job if !defined $options->{delay} or $options->{delay} <= 0;
+  $self->_notify_job if $delayed <= $now;
 
   return 1;
 }
@@ -371,8 +385,7 @@ sub stats {
   my $now = time;
   my %delayed_jobs;
   foreach my $id (@{$inactive_scan->all}) {
-    $delayed_jobs{$id} = 1 if $self->redis->hget("minion.job.$id", 'delayed') > $now
-      or $self->redis->scard("minion.job.$id.parents");
+    $delayed_jobs{$id} = 1 if $self->redis->hget("minion.job.$id", 'delayed') > $now;
   }
   $stats{delayed_jobs} = keys %delayed_jobs;
   $stats{active_workers} = 0;
@@ -414,8 +427,9 @@ sub _delete_job {
   $redis->srem('minion.job_state.inactive,active,failed', $id);
   $redis->srem('minion.jobs', $id);
   my $alphaid = sprintf '%012d', $id;
-  $redis->zrem("minion.ready_job_queue.$queue", $alphaid);
-  $redis->zrem("minion.ready_job_task.$task", $alphaid);
+  $redis->zrem("minion.inactive_job_queue.$queue", $alphaid);
+  $redis->zrem("minion.inactive_job_task.$task", $alphaid);
+  $redis->zrem('minion.inactive_job_delayed', $id);
   $redis->srem("minion.worker.$worker.jobs", $id) if defined $worker;
 }
 
@@ -428,19 +442,6 @@ sub _delete_worker {
 }
 
 sub _notify_job { shift->redis->publish('minion.job' => '') }
-
-sub _ready_job {
-  my ($self, $id) = @_;
-  my $tx = $self->redis->multi;
-  $tx->watch("minion.job.$id");
-  my ($priority, $queue, $state, $task) =
-    @{$self->redis->hmget("minion.job.$id", qw(priority queue state task))};
-  return undef unless defined $state and $state eq 'inactive';
-  my $alphaid = sprintf '%012d', $id;
-  $tx->zadd("minion.ready_job_queue.$queue", -($priority // 0) => $alphaid);
-  $tx->zadd("minion.ready_job_task.$task", 0 => $alphaid);
-  $tx->exec;
-}
 
 sub _try {
   my ($self, $id, $options) = @_;
@@ -468,15 +469,15 @@ sub _try {
     my $tx = $self->redis->multi;
     $tx->del($queue_key);
     $tx->zunionstore($queue_key, scalar(@$queues),
-      map { "minion.ready_job_queue.$_" } @$queues) if @$queues;
+      map { "minion.inactive_job_queue.$_" } @$queues) if @$queues;
     $tx->expire($queue_key, 60);
     $tx->del($task_key);
     $tx->zunionstore($task_key, scalar(@$tasks),
-      map { "minion.ready_job_task.$_" } @$tasks) if @$tasks;
+      map { "minion.inactive_job_task.$_" } @$tasks) if @$tasks;
     $tx->expire($task_key, 60);
 
     my $priority_hash = sha256_base64(join '$', $queue_hash, $task_hash, $$, $now);
-    my $priority_key = "minion.temp.ready_jobs.$priority_hash";
+    my $priority_key = "minion.temp.inactive_jobs.$priority_hash";
     $tx->del($priority_key);
     $tx->zinterstore($priority_key, 2, $queue_key, $task_key, WEIGHTS => 1, 0);
     $tx->expire($priority_key, 60);
@@ -509,8 +510,9 @@ sub _try {
   $job_tx->srem("minion.worker.$job->{worker}.jobs", $job->{id}) if defined $job->{worker};
   $job_tx->sadd("minion.worker.$id.jobs", $job->{id});
   my $alphaid = sprintf '%012d', $job->{id};
-  $job_tx->zrem("minion.ready_job_queue.$job->{queue}", $alphaid);
-  $job_tx->zrem("minion.ready_job_task.$job->{task}", $alphaid);
+  $job_tx->zrem("minion.inactive_job_queue.$job->{queue}", $alphaid);
+  $job_tx->zrem("minion.inactive_job_task.$job->{task}", $alphaid);
+  $job_tx->zrem('minion.inactive_job_delayed', $job->{id});
   $job_tx->exec;
 
   return {
