@@ -292,12 +292,14 @@ sub repair {
   }
 
   # Jobs with missing worker (can be retried)
-  my $active_scan = $redis->sscan('minion.job_state.active', 0);
-  foreach my $id (@{$active_scan->all}) {
-    my ($retries, $state, $worker) =
-      @{$redis->hmget("minion.job.$id", qw(retries state worker))};
-    next unless defined $state and $state eq 'active';
-    next if defined $worker and $redis->sismember('minion.workers', $worker);
+  my $tx = $redis->multi;
+  $tx->watch('minion.jobs_missing_worker');
+  my $jobs = $redis->sinter('minion.job_state.active', 'minion.jobs_missing_worker');
+  $tx->del('minion.jobs_missing_worker');
+  $tx->exec;
+
+  foreach my $id (@$jobs) {
+    my $retries = $redis->hget("minion.job.$id", 'retries');
     $self->fail_job($id, $retries, 'Worker went away');
   }
 
@@ -429,6 +431,8 @@ sub _delete_job {
 
 sub _delete_worker {
   my ($redis, $id) = @_;
+  $redis->sunionstore('minion.jobs_missing_worker',
+    'minion.jobs_missing_worker', "minion.worker.$id.jobs");
   $redis->del("minion.worker.$id", "minion.worker.$id.inbox",
     "minion.worker.$id.jobs");
   $redis->srem('minion.workers', $id);
