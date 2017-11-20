@@ -453,22 +453,11 @@ sub _try {
   my $now = time;
   if (defined $options->{id}) {
     $job_tx->watch("minion.job.$options->{id}"); # ensure job isn't taken by someone else
-    my ($delayed, $queue, $state, $task) =
-      @{$self->redis->hmget("minion.job.$options->{id}",
-      qw(delayed queue state task))};
-
-    if (defined $state and $state eq 'inactive'
-        and defined $delayed and $delayed <= $now
-        and defined $queue and (any { $_ eq $queue } @$queues)
-        and defined $task and exists $self->minion->tasks->{$task}) {
-      my $pending = @{$self->redis->sinter("minion.job.$options->{id}.parents",
-        'minion.job_state.inactive,active,failed')};
-      if (!$pending) {
-        $job = {};
-        @$job{qw(id args queue retries task worker)} =
-          @{$self->redis->hmget("minion.job.$options->{id}",
-          qw(id args queue retries task worker))};
-      }
+    my ($queue, $task) =
+      @{$self->redis->hmget("minion.job.$options->{id}", qw(queue task))};
+    if (defined $task and exists $self->minion->tasks->{$task}
+        and defined $queue and (any { $_ eq $queue } @$queues)) {
+      $job = $self->_try_job($options->{id}, $now);
     }
   } else {
     my $queue_hash = sha256_base64(encode 'UTF-8', join(',', @$queues));
@@ -495,21 +484,12 @@ sub _try {
     $tx->exec;
 
     my $i = 0;
-    while (my @check = @{$self->redis->zrange($priority_key, $i, $i)}) {
+    while (my @check = @{$self->redis->zrangebyscore($priority_key,
+      '-inf', '+inf', LIMIT => $i, 1)}) {
       my $check_id = 0+$check[0];
       $job_tx->watch("minion.job.$check_id"); # ensure job isn't taken by someone else
-      my ($state, $delayed) =
-        @{$self->redis->hmget("minion.job.$check_id", qw(state delayed))};
-      next unless defined $state and $state eq 'inactive'
-        and defined $delayed and $delayed <= $now;
-      my $pending = @{$self->redis->sinter("minion.job.$check_id.parents",
-        'minion.job_state.inactive,active,failed')};
-      next if $pending;
-      $job = {};
-      @$job{qw(id args queue retries task worker)} =
-        @{$self->redis->hmget("minion.job.$check_id",
-        qw(id args queue retries task worker))};
-      last;
+      $job = $self->_try_job($check_id, $now);
+      last if $job;
     } continue {
       $job_tx->discard;
       $job_tx = $self->redis->multi;
@@ -539,6 +519,22 @@ sub _try {
     retries => $job->{retries},
     task    => $job->{task},
   };
+}
+
+sub _try_job {
+  my ($self, $id, $now) = @_;
+  my ($state, $delayed) =
+    @{$self->redis->hmget("minion.job.$id", qw(state delayed))};
+  return undef unless defined $state and $state eq 'inactive'
+    and defined $delayed and $delayed <= $now;
+  my $pending = @{$self->redis->sinter("minion.job.$id.parents",
+    'minion.job_state.inactive,active,failed')};
+  return undef if $pending;
+  my %job;
+  @job{qw(id args queue retries task worker)} =
+    @{$self->redis->hmget("minion.job.$id",
+    qw(id args queue retries task worker))};
+  return \%job;
 }
 
 sub _update {
