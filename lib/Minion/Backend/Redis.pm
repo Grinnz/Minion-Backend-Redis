@@ -293,28 +293,27 @@ sub repair {
   # Jobs with missing worker (can be retried)
   $tx = $redis->multi;
   $tx->watch('minion.jobs_missing_worker');
-  my $jobs = $redis->sinter('minion.job_state.active', 'minion.jobs_missing_worker');
+  my $orphaned_jobs = $redis->sinter('minion.job_state.active',
+    'minion.jobs_missing_worker');
   $tx->del('minion.jobs_missing_worker');
   $tx->exec;
 
-  foreach my $id (@$jobs) {
+  foreach my $id (@$orphaned_jobs) {
     my $retries = $redis->hget("minion.job.$id", 'retries');
     $self->fail_job($id, $retries, 'Worker went away');
   }
 
   # Old jobs with no unresolved dependencies
-  my $finished_scan = $redis->sscan('minion.job_state.finished', 0);
-  while (my $ids = $finished_scan->next) {
-    foreach my $id (@$ids) {
-      my $tx = $redis->multi;
-      $tx->watch("minion.job.$id", "minion.job.$id.children");
-      my ($finished, $queue, $state, $task, $worker) =
-        @{$redis->hmget("minion.job.$id", qw(finished queue state task worker))};
-      next unless defined $finished && $finished <= time - $minion->remove_after;
-      next if @{$redis->sdiff("minion.job.$id.children", 'minion.job_state.finished')};
-      _delete_job($tx, $id, $queue, $state, $task, $worker);
-      $tx->exec;
-    }
+  my $old_jobs = $redis->zrangebyscore('minion.job_finished',
+    '-inf', '(' . (time - $minion->remove_after));
+  foreach my $id (@$old_jobs) {
+    my $tx = $redis->multi;
+    $tx->watch("minion.job.$id", "minion.job.$id.children");
+    my ($queue, $state, $task, $worker) =
+      @{$redis->hmget("minion.job.$id", qw(queue state task worker))};
+    next if @{$redis->sdiff("minion.job.$id.children", 'minion.job_state.finished')};
+    _delete_job($tx, $id, $queue, $state, $task, $worker);
+    $tx->exec;
   }
 }
 
@@ -425,6 +424,7 @@ sub _delete_job {
   $redis->zrem("minion.inactive_job_queue.$queue", $alphaid);
   $redis->zrem("minion.inactive_job_task.$task", $alphaid);
   $redis->zrem('minion.inactive_job_delayed', $id);
+  $redis->zrem('minion.job_finished', $id);
   $redis->srem("minion.worker.$worker.jobs", $id) if defined $worker;
 }
 
@@ -546,14 +546,16 @@ sub _update {
     @{$self->redis->hmget("minion.job.$id", qw(attempts retries state))};
   return undef unless defined $curr_retries and $curr_retries == $retries
     and defined $curr_state and $curr_state eq 'active';
+  my $now = time;
   $tx->hmset("minion.job.$id",
-    finished => time,
+    finished => $now,
     result   => to_json($result),
     state    => $state,
   );
   $tx->srem('minion.job_state.active', $id);
   $tx->srem('minion.job_state.inactive,active,failed', $id) unless $fail;
   $tx->sadd("minion.job_state.$state", $id);
+  $tx->zadd('minion.job_finished', $now => $id) unless $fail;
   $tx->exec;
 
   return 1 if !$fail || $attempts == 1;

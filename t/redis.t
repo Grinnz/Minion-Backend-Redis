@@ -75,11 +75,11 @@ my $id2 = $minion->enqueue('test');
 my $id3 = $minion->enqueue('test');
 $worker->dequeue(0)->perform for 1 .. 3;
 my $finished = $minion->backend->redis->hget("minion.job.$id2", 'finished');
-$minion->backend->redis->hset("minion.job.$id2",
-  finished => $finished - ($minion->remove_after + 1));
+$minion->backend->redis->zadd('minion.job_finished',
+  ($finished - $minion->remove_after - 1) => $id2);
 $finished = $minion->backend->redis->hget("minion.job.$id3", 'finished');
-$minion->backend->redis->hset("minion.job.$id3",
-  finished => $finished - ($minion->remove_after + 1));
+$minion->backend->redis->zadd('minion.job_finished',
+  ($finished - $minion->remove_after - 1) => $id3);
 $worker->unregister;
 $minion->repair;
 ok $minion->job($id), 'job has not been cleaned up';
@@ -156,9 +156,9 @@ ok $minion->guard('foo', 3600, {limit => 1}), 'locked again';
 
 # Reset
 $minion->reset->repair;
-ok !$minion->backend->redis->scard('minion.jobs'),    'no jobs';
-ok !$minion->backend->redis->scard('minion.locks'),   'no locks';
-ok !$minion->backend->redis->scard('minion.workers'), 'no workers';
+ok !$minion->backend->redis->scard('minion.jobs'),     'no jobs';
+ok !@{$minion->backend->redis->keys('minion.lock.*')}, 'no locks';
+ok !$minion->backend->redis->scard('minion.workers'),  'no workers';
 
 # Stats
 $minion->add_task(
