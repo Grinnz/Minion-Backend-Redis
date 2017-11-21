@@ -10,4 +10,4 @@ requires 'Sys::Hostname';
 requires 'Time::HiRes';
 test_requires 'Test::More' => '0.88';
 test_requires 'POSIX';
-author_requires 'Minion' => '8.01';
+author_requires 'Minion' => '8.02';
