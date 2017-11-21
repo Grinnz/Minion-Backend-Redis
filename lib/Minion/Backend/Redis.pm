@@ -283,16 +283,15 @@ sub repair {
   # Workers without heartbeat
   my $redis  = $self->redis;
   my $minion = $self->minion;
+  my $tx = $redis->multi;
+  $tx->watch('minion.worker_notified');
   my $missing = $redis->zrangebyscore('minion.worker_notified',
     '-inf', '(' . (time - $minion->missing_after));
-  foreach my $id (@$missing) {
-    my $tx = $redis->multi;
-    _delete_worker($tx, $id);
-    $tx->exec;
-  }
+  _delete_worker($tx, $_) for @$missing;
+  $tx->exec;
 
   # Jobs with missing worker (can be retried)
-  my $tx = $redis->multi;
+  $tx = $redis->multi;
   $tx->watch('minion.jobs_missing_worker');
   my $jobs = $redis->sinter('minion.job_state.active', 'minion.jobs_missing_worker');
   $tx->del('minion.jobs_missing_worker');
