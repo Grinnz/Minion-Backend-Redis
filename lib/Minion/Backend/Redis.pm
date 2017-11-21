@@ -121,26 +121,27 @@ sub finish_job { shift->_update(0, @_) }
 sub list_jobs {
   my ($self, $offset, $limit, $options) = @_;
 
+  my $tx = $self->redis->multi;
   my @sets = ('minion.jobs', map { "minion.job_$_.$options->{$_}" }
     grep { defined $options->{$_} } qw(queue state task));
   if (defined(my $ids = $options->{ids})) {
-    my $tx = $self->redis->multi;
     my $key = 'minion.temp.jobs.' . join(',', @$ids);
     $tx->del($key);
     $tx->sadd($key, @$ids) if @$ids;
     $tx->expire($key, 60);
-    $tx->exec;
     push @sets, $key;
   }
-  my @job_ids = sort { $b <=> $a } @{$self->redis->sinter(@sets)};
-  my $total = @job_ids;
+  my $jobs_hash = sha256_base64(join '$', $$, time);
+  my $jobs_key = "minion.temp.list_jobs.$jobs_hash";
+  $tx->sinterstore($jobs_key, @sets);
+  $tx->expire($jobs_key, 60);
+  $tx->exec;
 
-  @job_ids = () if $offset >= @job_ids;
-  splice @job_ids, 0, $offset if $offset < @job_ids;
-  splice @job_ids, $limit if $limit < @job_ids;
+  my $job_ids = $self->redis->sort($jobs_key, LIMIT => $offset, $limit, 'DESC');
+  my $total = $self->redis->scard($jobs_key);
 
   my @jobs;
-  foreach my $id (@job_ids) {
+  foreach my $id (@$job_ids) {
     my %job_info = @{$self->redis->hgetall("minion.job.$id")};
 
     my $children = $self->redis->smembers("minion.job.$id.children");
@@ -175,15 +176,11 @@ sub list_jobs {
 sub list_workers {
   my ($self, $offset, $limit, $options) = @_;
 
-  my @worker_ids = sort { $b <=> $a } @{$self->redis->smembers('minion.workers')};
-  my $total = @worker_ids;
-
-  @worker_ids = () if $offset >= @worker_ids;
-  splice @worker_ids, 0, $offset if $offset < @worker_ids;
-  splice @worker_ids, $limit if $limit < @worker_ids;
+  my $worker_ids = $self->redis->sort('minion.workers', LIMIT => $offset, $limit, 'DESC');
+  my $total = $self->redis->scard('minion.workers');
 
   my @workers;
-  foreach my $id (@worker_ids) {
+  foreach my $id (@$worker_ids) {
     my %worker_info = @{$self->redis->hgetall("minion.worker.$id")};
 
     my $notified = $self->redis->zscore('minion.worker_notified', $id);
